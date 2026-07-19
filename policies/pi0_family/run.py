@@ -44,6 +44,15 @@ parser.add_argument("--randomize-background", "--randomize_background", action="
                           "recorded in the per-task env_cfg.json."))
 parser.add_argument("--background-seed", "--background_seed", type=int, default=None,
                     help="Seed for reproducible per-task background sampling. Used with --randomize-background.")
+parser.add_argument("--wmx", action="store_true",
+                    help=("Execute action chunks through the WMX lookahead controller: chunks are "
+                          "streamed to wmx-r2 via wmx_chunk_bridge.py and the arm follows the WMX "
+                          "commanded joint positions. Requires the wmx-r2 Franka stack and the "
+                          "bridge to be running, and --num-envs 1."))
+parser.add_argument("--wmx-host", "--wmx_host", type=str, default="127.0.0.1",
+                    help="WMX chunk bridge host (default: 127.0.0.1).")
+parser.add_argument("--wmx-port", "--wmx_port", type=int, default=5555,
+                    help="WMX chunk bridge port (default: 5555).")
 
 from robolab.eval.runner import add_common_eval_args, run_evaluation  # noqa: E402
 
@@ -82,7 +91,16 @@ def make_client(args: argparse.Namespace) -> Pi0DroidJointposClient:
         open_loop_horizon=args.open_loop_horizon,
         policy_variant=args.policy,
     )
-    return Pi0DroidJointposClient(**{k: v for k, v in kwargs.items() if v is not None})
+    kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    if args.wmx:
+        if getattr(args, "num_envs", 1) not in (None, 1):
+            raise ValueError("--wmx drives a single WMX engine; run with --num-envs 1")
+        from policies.pi0_family.wmx_client import WmxPi0DroidJointposClient
+
+        return WmxPi0DroidJointposClient(
+            wmx_host=args.wmx_host, wmx_port=args.wmx_port, **kwargs
+        )
+    return Pi0DroidJointposClient(**kwargs)
 
 
 def main() -> None:
