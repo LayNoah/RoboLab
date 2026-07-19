@@ -57,6 +57,12 @@ parser.add_argument("--wmx-full-chunk", "--wmx_full_chunk", action="store_true",
                     help=("Disable partial streaming + temporal ensembling and send every fresh "
                           "chunk whole. Use for controller-stack baselines, e.g. the ros2_control "
                           "JTC bridge (ros2c_chunk_bridge.py) on --wmx-port 5556."))
+parser.add_argument("--wmx-stream", "--wmx_stream", choices=["jit", "segment", "full"],
+                    default="jit",
+                    help=("WMX streaming mode: 'jit' (default) keeps the controller buffer only "
+                          "~2 points ahead for preemption-grade responsiveness; 'segment' streams "
+                          "one open-loop horizon per re-plan; 'full' sends whole chunks "
+                          "(equivalent to --wmx-full-chunk)."))
 
 from robolab.eval.runner import add_common_eval_args, run_evaluation  # noqa: E402
 
@@ -101,9 +107,10 @@ def make_client(args: argparse.Namespace) -> Pi0DroidJointposClient:
             raise ValueError("--wmx drives a single WMX engine; run with --num-envs 1")
         from policies.pi0_family.wmx_client import WmxPi0DroidJointposClient
 
+        stream_mode = "full" if args.wmx_full_chunk else args.wmx_stream
         return WmxPi0DroidJointposClient(
             wmx_host=args.wmx_host, wmx_port=args.wmx_port,
-            stream_full_chunk=args.wmx_full_chunk, **kwargs
+            stream_mode=stream_mode, **kwargs
         )
     return Pi0DroidJointposClient(**kwargs)
 

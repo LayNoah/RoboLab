@@ -8,22 +8,31 @@ bindings) and returns the WMX *commanded joint positions* as the per-step arm
 action. The Isaac Lab arm then tracks WMX output, so the sim shows exactly the
 motion the motion controller would produce on real hardware.
 
-Latency/smoothness refinements over naive full-chunk streaming:
+Streaming modes (``stream_mode``):
 
-- **Partial chunk streaming**: only the first ``open_loop_horizon`` points of
-  each chunk are streamed, so re-inference happens before the previous chunk
-  is exhausted and the WMX queue depth (and therefore the control lag) stays
-  at roughly one horizon instead of one full chunk.
-- **Temporal ensembling** (ACT-style): with re-inference every H < chunk_len
-  steps, consecutive chunks overlap; each streamed point is a weighted average
-  of every stored chunk's prediction for that timestep (newest weight 1, each
-  older chunk decayed by ``te_decay``). This removes re-planning jumps at the
-  source, allowing a shorter WMX smoothing filter.
-- **Warm-up hold**: the first env step after a reset triggers Isaac's JIT
-  warm-up and can stall for seconds while WMX keeps running on the wall
-  clock. The first ``infer`` therefore only presets WMX to the sim pose and
-  holds; streaming starts from the second step. Extreme stalls are also
-  excluded from the chunk-pacing EMA.
+- ``jit`` (default): **drip / just-in-time streaming.** Every step, top the
+  WMX buffer up to only ``jit_lead`` (2) points ahead. The un-executed
+  backlog is therefore bounded by ~2 control periods (~130 ms at 15 Hz), so
+  when the policy re-plans, at most 2 stale points execute before the new
+  intent takes effect — preemption-grade responsiveness without ever
+  stopping the lookahead stream. (The WMX lookahead module has no
+  truncate-pending-points API, and Stop/Clear/Start would decelerate to a
+  stop on every re-plan; keeping the buffer nearly empty makes preemption
+  unnecessary.)
+- ``segment``: stream ``open_loop_horizon`` ensembled points per re-plan
+  (the earlier TE behavior; backlog ~0.5 s — measured to break closed-loop
+  grasping: the arm executes stale intent while the passthrough gripper
+  fires on the VLA's schedule).
+- ``full``: send every fresh chunk whole, the way a conventional client
+  hands trajectories to a controller. Used for controller-stack baselines
+  (e.g. the ros2_control JTC bridge on port 5556).
+
+Temporal ensembling (ACT-style) applies in ``jit`` and ``segment`` modes:
+each streamed point is a weighted average of every stored chunk's prediction
+for that timestep (newest weight 1, each older chunk decayed by ``te_decay``).
+
+The first ``infer`` after a reset only presets WMX to the sim pose and holds
+one step, so Isaac's JIT warm-up stall cannot race the wall-clock WMX stream.
 
 The gripper dimension (binary) bypasses WMX and passes through from the
 newest chunk unchanged.
@@ -92,9 +101,9 @@ class WmxPi0DroidJointposClient(Pi0DroidJointposClient):
     """Route pi0-family chunks through the WMX lookahead controller.
 
     Only ``env_id == 0`` is supported (one WMX engine drives one arm); run
-    with ``--num-envs 1``. Pass ``--open-loop-horizon 8`` (or similar, below
-    the model's 15-step chunk) to enable overlap for temporal ensembling and
-    to halve the streaming lag.
+    with ``--num-envs 1``. For ``jit``/``segment`` modes pass
+    ``--open-loop-horizon 8`` (below the model's 15-step chunk) so
+    consecutive chunks overlap for temporal ensembling.
     """
 
     def __init__(
@@ -103,24 +112,29 @@ class WmxPi0DroidJointposClient(Pi0DroidJointposClient):
         wmx_host: str = "127.0.0.1",
         wmx_port: int = 5555,
         te_decay: float = 0.5,
-        stream_full_chunk: bool = False,
+        stream_mode: str = "jit",
+        jit_lead: int = 2,
+        stream_full_chunk: bool = False,   # back-compat alias for stream_mode="full"
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        if stream_full_chunk:
+            stream_mode = "full"
+        if stream_mode not in ("jit", "segment", "full"):
+            raise ValueError(f"unknown stream_mode {stream_mode!r}")
         self.bridge = WmxBridgeConnection(wmx_host, wmx_port)
+        self.stream_mode = stream_mode
         self.te_decay = float(te_decay)
-        # Full-chunk mode disables partial streaming + ensembling: every fresh
-        # chunk is sent whole, the way a conventional client would hand it to
-        # a trajectory controller. Used for controller-stack baselines (e.g.
-        # the ros2_control JTC bridge on another port).
-        self.stream_full_chunk = bool(stream_full_chunk)
-        # Adaptive chunk point spacing: each streamed segment should span the
-        # wall time the sim takes to consume it (open_loop_horizon steps).
-        # EMA of the observed inter-chunk wall time, seeded at nominal 15 Hz.
+        self.jit_lead = int(jit_lead)
+        # Pacing. segment/full modes: EMA of the wall time spanned by one
+        # streamed segment. jit mode: EMA of the wall time per sim step.
         self._nominal_dt = 1.0 / 15.0
         self._chunk_dt_ema = self._nominal_dt
         self._last_chunk_time: float | None = None
+        self._step_dt_ema: float | None = None
+        self._last_step_time: float | None = None
         self._step = 0                      # global step index (this episode)
+        self._streamed_until = -1           # last step index streamed (jit)
         self._history: deque = deque(maxlen=4)  # (start_step, chunk) pairs
         self._warmup_done = False
         reply = self.bridge.request({"cmd": "state"})
@@ -128,7 +142,8 @@ class WmxPi0DroidJointposClient(Pi0DroidJointposClient):
             logger.warning("[WMX] bridge reachable but no /joint_states yet: %s", reply)
         print(
             f"[{self.__class__.__name__}] Connected to WMX bridge at {wmx_host}:{wmx_port} "
-            f"(horizon={self.open_loop_horizon}, te_decay={self.te_decay})."
+            f"(mode={self.stream_mode}, horizon={self.open_loop_horizon}, "
+            f"te_decay={self.te_decay}, jit_lead={self.jit_lead})."
         )
 
     # ------------------------------------------------------------------
@@ -156,13 +171,19 @@ class WmxPi0DroidJointposClient(Pi0DroidJointposClient):
             hold[7] = 1.0 if float(np.ravel(extracted["gripper_position"])[0]) > 0.5 else 0.0
             return {"action": hold, "viz": self._build_visualization(extracted)}
 
+        self._update_step_pacing()
+
         if self._needs_refresh(env_id):
             request = self._pack_request(extracted, instruction)
             response = self._query_server(request)
             chunk = self._postprocess_chunk(self._unpack_response(response))
             self._set_chunk(env_id, chunk)
             self._history.append((self._step, np.asarray(chunk, dtype=np.float64)))
-            self._stream_segment(self._step)
+            if self.stream_mode in ("segment", "full"):
+                self._stream_segment(self._step)
+
+        if self.stream_mode == "jit":
+            self._stream_jit()
 
         # Advance the chunk counter (drives re-inference cadence) and keep the
         # newest VLA action as fallback + gripper source.
@@ -181,6 +202,17 @@ class WmxPi0DroidJointposClient(Pi0DroidJointposClient):
 
     # ------------------------------------------------------------------
 
+    def _update_step_pacing(self) -> None:
+        """EMA of the wall time per sim step, excluding extreme stalls."""
+        now = time.monotonic()
+        if self._last_step_time is not None:
+            dt = now - self._last_step_time
+            if self._step_dt_ema is None:
+                self._step_dt_ema = max(dt, self._nominal_dt)
+            elif dt <= 3.0 * self._step_dt_ema:
+                self._step_dt_ema = 0.8 * self._step_dt_ema + 0.2 * dt
+        self._last_step_time = now
+
     def _ensembled_position(self, step: int) -> np.ndarray | None:
         """Weighted average of all stored chunks' predictions for ``step``."""
         total_w = 0.0
@@ -196,9 +228,28 @@ class WmxPi0DroidJointposClient(Pi0DroidJointposClient):
             return None
         return acc / total_w
 
+    def _stream_jit(self) -> None:
+        """Top the WMX buffer up to ``jit_lead`` points ahead of the sim."""
+        points = []
+        s = self._streamed_until + 1
+        while s <= self._step + self.jit_lead:
+            q = self._ensembled_position(s)
+            if q is None:
+                break
+            points.append([float(v) for v in q])
+            self._streamed_until = s
+            s += 1
+        if not points:
+            return
+        self.bridge.request({
+            "cmd": "chunk",
+            "positions": points,
+            "dt": self._step_dt_ema or self._nominal_dt,
+        })
+
     def _stream_segment(self, start_step: int) -> None:
-        """Stream the next segment (ensembled or full chunk) to the bridge."""
-        if self.stream_full_chunk:
+        """Stream one segment (ensembled horizon or full chunk) per re-plan."""
+        if self.stream_mode == "full":
             _, chunk = self._history[-1]
             points = [[float(v) for v in q[:7]] for q in chunk]
         else:
@@ -235,7 +286,10 @@ class WmxPi0DroidJointposClient(Pi0DroidJointposClient):
             logger.exception("[WMX] failed to stop lookahead stream on reset")
         self._last_chunk_time = None
         self._chunk_dt_ema = self._nominal_dt
+        self._step_dt_ema = None
+        self._last_step_time = None
         self._step = 0
+        self._streamed_until = -1
         self._history.clear()
         self._warmup_done = False
         super().reset(env_id=env_id)
