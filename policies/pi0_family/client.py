@@ -116,7 +116,27 @@ class Pi0DroidJointposClient(InferenceClient):
     def _postprocess_chunk(self, chunk: np.ndarray) -> np.ndarray:
         chunk = chunk.copy()
         chunk[..., -1] = (chunk[..., -1] > 0.5).astype(chunk.dtype)
+        self._maybe_log_chunk(chunk)
         return chunk
+
+    def _maybe_log_chunk(self, chunk: np.ndarray) -> None:
+        """Opt-in chunk logging for offline controller replay experiments.
+
+        Set CHUNK_LOG_PATH to a .jsonl path to record every predicted chunk
+        with its wall-clock arrival time.
+        """
+        import json
+        import os
+        import time
+
+        path = os.environ.get("CHUNK_LOG_PATH")
+        if not path:
+            return
+        with open(path, "a") as f:
+            f.write(json.dumps({
+                "t_wall": time.time(),
+                "chunk": np.asarray(chunk, dtype=float).tolist(),
+            }) + "\n")
 
     def _build_visualization(self, extracted_obs: dict) -> np.ndarray:
         img1 = image_tools.resize_with_pad(extracted_obs["right_image"], 224, 224)
