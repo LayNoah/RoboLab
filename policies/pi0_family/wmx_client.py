@@ -103,11 +103,17 @@ class WmxPi0DroidJointposClient(Pi0DroidJointposClient):
         wmx_host: str = "127.0.0.1",
         wmx_port: int = 5555,
         te_decay: float = 0.5,
+        stream_full_chunk: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.bridge = WmxBridgeConnection(wmx_host, wmx_port)
         self.te_decay = float(te_decay)
+        # Full-chunk mode disables partial streaming + ensembling: every fresh
+        # chunk is sent whole, the way a conventional client would hand it to
+        # a trajectory controller. Used for controller-stack baselines (e.g.
+        # the ros2_control JTC bridge on another port).
+        self.stream_full_chunk = bool(stream_full_chunk)
         # Adaptive chunk point spacing: each streamed segment should span the
         # wall time the sim takes to consume it (open_loop_horizon steps).
         # EMA of the observed inter-chunk wall time, seeded at nominal 15 Hz.
@@ -191,14 +197,17 @@ class WmxPi0DroidJointposClient(Pi0DroidJointposClient):
         return acc / total_w
 
     def _stream_segment(self, start_step: int) -> None:
-        """Stream the next ``open_loop_horizon`` ensembled points to WMX."""
-        horizon = self.open_loop_horizon
-        points = []
-        for i in range(horizon):
-            q = self._ensembled_position(start_step + i)
-            if q is None:  # cannot happen while the newest chunk covers i
-                break
-            points.append([float(v) for v in q])
+        """Stream the next segment (ensembled or full chunk) to the bridge."""
+        if self.stream_full_chunk:
+            _, chunk = self._history[-1]
+            points = [[float(v) for v in q[:7]] for q in chunk]
+        else:
+            points = []
+            for i in range(self.open_loop_horizon):
+                q = self._ensembled_position(start_step + i)
+                if q is None:  # cannot happen while the newest chunk covers i
+                    break
+                points.append([float(v) for v in q])
         if not points:
             return
 

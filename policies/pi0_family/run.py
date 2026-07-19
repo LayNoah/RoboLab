@@ -53,6 +53,10 @@ parser.add_argument("--wmx-host", "--wmx_host", type=str, default="127.0.0.1",
                     help="WMX chunk bridge host (default: 127.0.0.1).")
 parser.add_argument("--wmx-port", "--wmx_port", type=int, default=5555,
                     help="WMX chunk bridge port (default: 5555).")
+parser.add_argument("--wmx-full-chunk", "--wmx_full_chunk", action="store_true",
+                    help=("Disable partial streaming + temporal ensembling and send every fresh "
+                          "chunk whole. Use for controller-stack baselines, e.g. the ros2_control "
+                          "JTC bridge (ros2c_chunk_bridge.py) on --wmx-port 5556."))
 
 from robolab.eval.runner import add_common_eval_args, run_evaluation  # noqa: E402
 
@@ -98,7 +102,8 @@ def make_client(args: argparse.Namespace) -> Pi0DroidJointposClient:
         from policies.pi0_family.wmx_client import WmxPi0DroidJointposClient
 
         return WmxPi0DroidJointposClient(
-            wmx_host=args.wmx_host, wmx_port=args.wmx_port, **kwargs
+            wmx_host=args.wmx_host, wmx_port=args.wmx_port,
+            stream_full_chunk=args.wmx_full_chunk, **kwargs
         )
     return Pi0DroidJointposClient(**kwargs)
 
